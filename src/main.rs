@@ -6,6 +6,7 @@ type ParticleKindId = usize;
 struct ParticleKind {
     color: Color,
     radius: f32,
+    force_max_distance: f32,
 }
 
 type ParticleId = usize;
@@ -16,9 +17,19 @@ struct Particle {
     kind_id: ParticleKindId,
 }
 
-#[derive(Default)]
-struct Simulation {
+struct SimulationConfig {
     size: (f32, f32),
+    rng: Box<dyn RngCore>,
+    particle_coloring: fn (&mut dyn RngCore) -> Color,
+    particle_radius: fn (&mut dyn RngCore) -> f32,
+    generate_force_max_distance: fn (&mut dyn RngCore) -> f32,
+    force_constant: f32,
+    energy: f32,
+    max_vel: f32,
+}
+
+struct Simulation {
+    cfg: SimulationConfig,
 
     force_coefficients: HashMap<(ParticleKindId, ParticleKindId), f32>,
 
@@ -30,21 +41,40 @@ struct Simulation {
 }
 
 impl Simulation {
-    pub fn new() -> Self { Self::default() }
+    pub fn new(cfg: SimulationConfig) -> Self {
+        Self {
+            cfg,
+            force_coefficients: Default::default(),
+            next_particle_id: 0,
+            particles: Default::default(),
+            next_particle_kind_id: 0,
+            particle_kinds: Default::default(),
+        }
+    }
+
+    pub fn size(&self) -> (f32, f32) { self.cfg.size }
+    pub fn size_mut(&mut self) -> &mut (f32, f32) { &mut self.cfg.size }
+
+    pub fn width(&self) -> f32 { self.cfg.size.0 }
+    pub fn height(&self) -> f32 { self.cfg.size.1 }
+    
+    pub fn rng(&self) -> &dyn RngCore { &self.cfg.rng }
+    pub fn rng_mut(&mut self) -> &mut dyn RngCore { &mut self.cfg.rng }
 
     pub fn add_random_kind(&mut self) -> ParticleKindId {
-        let color = Color::color_from_hsv(rand::thread_rng().gen_range(0.0..360.0), 0.9, 0.9);
-        let radius = 15.0;
-        let kind = ParticleKind { color, radius };
+        let color = (self.cfg.particle_coloring)(self.rng_mut());
+        let radius = (self.cfg.particle_radius)(self.rng_mut());
+        let force_max_distance = (self.cfg.generate_force_max_distance)(self.rng_mut());
+        let kind = ParticleKind { color, radius, force_max_distance };
         let kind_id = self.next_particle_kind_id;
 
         for &other_kind_id in self.particle_kinds.keys() {
-            let coefficient = rand::thread_rng().gen_range(-1.0..1.0);
+            let coefficient = self.cfg.rng.gen_range(-1.0..1.0);
             self.force_coefficients.insert((kind_id, other_kind_id), coefficient);
-            let coefficient = rand::thread_rng().gen_range(-1.0..1.0);
+            let coefficient = self.cfg.rng.gen_range(-1.0..1.0);
             self.force_coefficients.insert((other_kind_id, kind_id), coefficient);
         }
-        let coefficient = rand::thread_rng().gen_range(-1.0..1.0);
+        let coefficient = self.rng_mut().gen_range(-1.0..1.0);
         self.force_coefficients.insert((kind_id, kind_id), coefficient);
         self.next_particle_kind_id += 1;
         self.particle_kinds.insert(kind_id, kind);
@@ -52,10 +82,10 @@ impl Simulation {
     }
 
     pub fn add_random_particle(&mut self) -> ParticleId {
-        let kind_id = *self.particle_kinds.keys().choose(&mut rand::thread_rng()).unwrap();
+        let kind_id = self.particle_kinds.keys().choose(&mut self.cfg.rng).cloned().unwrap();
         let pos = Vector2::new(
-            rand::thread_rng().gen_range(-self.size.0..self.size.0),
-            rand::thread_rng().gen_range(-self.size.1..self.size.1),
+            self.cfg.rng.gen_range(-0.5*self.width()..0.5*self.width()),
+            self.cfg.rng.gen_range(-0.5*self.height()..0.5*self.height()),
         );
         let vel = Vector2::zero();
         let particle = Particle { pos, vel, kind_id };
@@ -69,9 +99,33 @@ impl Simulation {
     pub fn draw<Draw: RaylibDraw>(&self, d: &mut Draw) {
         d.clear_background(Color::BLACK);
         for Particle { pos, kind_id, .. } in self.particles.values() {
-            let ParticleKind { color, radius } = self.particle_kinds[kind_id];
+            let ParticleKind { color, radius, .. } = self.particle_kinds[kind_id];
             d.draw_circle_v(pos, radius, color);
         }
+    }
+
+    fn border_collision(particle: &mut Particle, particle_kind: &ParticleKind, sim_size: (f32, f32)) {
+        let max_x = (sim_size.0 - particle_kind.radius) * 0.5;
+        let max_y = (sim_size.1 - particle_kind.radius) * 0.5;
+
+        if particle.pos.x.abs() > max_x {
+            particle.pos.x = max_x * particle.pos.x.signum();
+            particle.vel.x *= -1.0;
+        }
+        if particle.pos.y.abs() > max_y {
+            particle.pos.y = max_y * particle.pos.y.signum();
+            particle.vel.y *= -1.0;
+        }
+    }
+
+    fn distribute_energy(particle_vel: &mut Vector2, total_energy: f32, target_energy: f32) {
+        if total_energy == target_energy || total_energy == 0.0 { return; }
+
+        *particle_vel *= target_energy / total_energy;
+    }
+
+    fn force_formula(k: f32, dist: f32, min_dist: f32, max_dist: f32) -> f32 {
+        k * (max_dist - dist) / (max_dist - min_dist)
     }
 
     pub fn step(&mut self, delta_time: f32) {
@@ -79,58 +133,77 @@ impl Simulation {
         for (&id, particle) in &mut self.particles {
             let particle_kind = &self.particle_kinds[&particle.kind_id];
 
+            //  Move the particle
             particle.pos += old_particles[&id].vel * delta_time;
-            let (max_x, max_y) = (self.size.0 - particle_kind.radius, self.size.1 - particle_kind.radius);
-            if particle.pos.x.abs() > max_x {
-                particle.pos.x = max_x * particle.pos.x.signum();
-                particle.vel.x *= -1.0;
-            }
-            if particle.pos.y.abs() > max_y {
-                particle.pos.y = max_y * particle.pos.y.signum();
-                particle.vel.y *= -1.0;
-            }
-            particle.vel *= 0.99;
-            for (&other_id, other_particle) in &old_particles {
-                let other_particle_kind = &self.particle_kinds[&other_particle.kind_id];
+            //  Collision
+            Self::border_collision(particle, particle_kind, self.cfg.size);
 
+            for (&other_id, other_particle) in &old_particles {
                 if id != other_id {
+                    let other_particle_kind = &self.particle_kinds[&other_particle.kind_id];
+
                     let dir = other_particle.pos - particle.pos;
-                    let dist = dir.length();
-                    let dir = dir / dist;
-                    if dist > self.particle_kinds[&particle.kind_id].radius + self.particle_kinds[&other_particle.kind_id].radius {
-                        let coefficient = self.force_coefficients[&(particle.kind_id, other_particle.kind_id)];
-                        particle.vel += dir / dist / dist * coefficient * 2000000.0 * delta_time;
+                    let square_dist = dir.length_sqr();
+                    let min_dist = particle_kind.radius + other_particle_kind.radius;
+                    let max_dist = particle_kind.force_max_distance; 
+                    if square_dist > max_dist * max_dist || square_dist == 0. {
+                        //  nothing
                     } else {
-                        particle.vel -= dir * 20.0 * delta_time * 10.0;
+                        let dist = dir.length();
+                        let dirn = dir / dist;
+                        if dist > min_dist {
+                            let coefficient = self.force_coefficients[&(particle.kind_id, other_particle.kind_id)];
+                            let force = Self::force_formula(self.cfg.force_constant, dist, particle_kind.radius, particle_kind.force_max_distance);
+                            particle.vel += dirn * force * coefficient * delta_time;
+                        } else {
+                            //  move the rigidbody half way out - the other half is moved in
+                            //  another iteration of the loop
+                            particle.pos -= dirn * (min_dist - dist) / 2.;
+                        }
+                    }
+                    if particle.vel.length_sqr() > self.cfg.max_vel * self.cfg.max_vel {
+                        particle.vel = particle.vel.normalized() * self.cfg.max_vel;
                     }
                 }
             }
+        }
+
+        let total_energy = self.particles.values().map(|p| p.vel.length_sqr()).sum();
+        for particle in self.particles.values_mut() {
+            Self::distribute_energy(&mut particle.vel, total_energy, self.cfg.energy);
         }
     }
 }
 
 
 fn main() {
-    let mut sim = Simulation::new();
-    sim.size = (640.0, 480.0);
-    for _ in 0..5 { sim.add_random_kind(); };
-    for _ in 0..150 { sim.add_random_particle(); };
+    let mut sim = Simulation::new(SimulationConfig {
+        size: (200., 100.),
+        rng: Box::new(rand::thread_rng()),
+        particle_coloring: |rng| Color::color_from_hsv(rng.gen_range(0.0..360.0), 0.9, 0.9),
+        particle_radius: |rng| rng.gen_range(0.5..=2.0),
+        generate_force_max_distance: |rng| rng.gen_range(10.0..30.0),
+        force_constant: 50.0,
+        energy: 10000.0,
+        max_vel: 10.0,
+    });
+    for _ in 0..4 { sim.add_random_kind(); };
+    for _ in 0..600 { sim.add_random_particle(); };
     let (mut rl, thread) = raylib::init()
-        .size(640, 480)
+        .size(1200, 600)
         .title("Hello, World")
         .build();
 
     while !rl.window_should_close() {
-        let mut d = rl.begin_drawing(&thread);
-
-        d.clear_background(Color::WHITE);
-        let mut d = d.begin_mode2D(Camera2D {
-            offset: Vector2::from(sim.size) * 0.5,
+        let camera = Camera2D {
+            offset: Vector2::new(rl.get_screen_width() as _, rl.get_screen_height() as _) * 0.5,
             target: Vector2::zero(),
             rotation: 0.0,
-            zoom: 0.5,
-        });
-        sim.draw(&mut d);
-        sim.step(d.get_frame_time());
+            zoom: rl.get_screen_width() as f32 / sim.cfg.size.0,
+        };
+        let mut screen_draw = rl.begin_drawing(&thread);
+        let mut world_draw = screen_draw.begin_mode2D(camera);
+        sim.draw(&mut world_draw);
+        sim.step(world_draw.get_frame_time());
     }
 }
