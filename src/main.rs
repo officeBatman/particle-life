@@ -2,6 +2,16 @@ use std::collections::HashMap;
 use raylib::prelude::*;
 use rand::prelude::*;
 
+fn random_on_circle<R: RngCore>(rng: &mut R) -> Vector2 {
+    let angle: f32 = rng.gen_range(0.0..=360f32.to_radians());
+    Vector2::new(angle.cos(), angle.sin())
+}
+
+fn random_in_circle<R: RngCore>(rng: &mut R) -> Vector2 {
+    let point = Vector2::new(rng.gen_range(-1.0..=1.0), rng.gen_range(-1.0..=1.0));
+    if point.length_sqr() <= 1.0 { point } else { random_in_circle(rng) }
+}
+
 type ParticleKindId = usize;
 struct ParticleKind {
     color: Color,
@@ -26,6 +36,8 @@ struct SimulationConfig {
     force_constant: f32,
     energy: f32,
     max_vel: f32,
+    flacuation_constant: f32,
+    collision_vel_damping: f32,
 }
 
 struct Simulation {
@@ -121,7 +133,7 @@ impl Simulation {
     fn distribute_energy(particle_vel: &mut Vector2, total_energy: f32, target_energy: f32) {
         if total_energy == target_energy || total_energy == 0.0 { return; }
 
-        *particle_vel *= target_energy / total_energy;
+        *particle_vel *= (target_energy / total_energy).sqrt();
     }
 
     fn force_formula(k: f32, dist: f32, min_dist: f32, max_dist: f32) -> f32 {
@@ -137,6 +149,8 @@ impl Simulation {
             particle.pos += old_particles[&id].vel * delta_time;
             //  Collision
             Self::border_collision(particle, particle_kind, self.cfg.size);
+            //  Flacuation
+            particle.vel += random_in_circle(&mut self.cfg.rng) * self.cfg.flacuation_constant * delta_time;
 
             for (&other_id, other_particle) in &old_particles {
                 if id != other_id {
@@ -159,6 +173,7 @@ impl Simulation {
                             //  move the rigidbody half way out - the other half is moved in
                             //  another iteration of the loop
                             particle.pos -= dirn * (min_dist - dist) / 2.;
+                            particle.vel -= dirn * particle.vel.dot(dirn) * self.cfg.collision_vel_damping;
                         }
                     }
                     if particle.vel.length_sqr() > self.cfg.max_vel * self.cfg.max_vel {
@@ -177,22 +192,26 @@ impl Simulation {
 
 
 fn main() {
-    let mut sim = Simulation::new(SimulationConfig {
-        size: (200., 100.),
-        rng: Box::new(rand::thread_rng()),
-        particle_coloring: |rng| Color::color_from_hsv(rng.gen_range(0.0..360.0), 0.9, 0.9),
-        particle_radius: |rng| rng.gen_range(0.5..=2.0),
-        generate_force_max_distance: |rng| rng.gen_range(10.0..30.0),
-        force_constant: 50.0,
-        energy: 10000.0,
-        max_vel: 10.0,
-    });
-    for _ in 0..4 { sim.add_random_kind(); };
-    for _ in 0..600 { sim.add_random_particle(); };
     let (mut rl, thread) = raylib::init()
-        .size(1200, 600)
+        .fullscreen()
+        .size(0, 0)
         .title("Hello, World")
         .build();
+
+    let mut sim = Simulation::new(SimulationConfig {
+        size: (rl.get_screen_width() as f32 / rl.get_screen_height() as f32 * 100., 100.),
+        rng: Box::new(rand::thread_rng()),
+        particle_coloring: |rng| Color::color_from_hsv(rng.gen_range(0.0..360.0), 0.9, 0.9),
+        particle_radius: |rng| rng.gen_range(0.8..=1.2),
+        generate_force_max_distance: |rng| rng.gen_range(1.0..60.0),
+        force_constant: 50.0,
+        energy: 20000.0,
+        max_vel: 30.0,
+        flacuation_constant: 20.0,
+        collision_vel_damping: 0.5,
+    });
+    for _ in 0..10 { sim.add_random_kind(); };
+    for _ in 0..300 { sim.add_random_particle(); };
 
     while !rl.window_should_close() {
         let camera = Camera2D {
