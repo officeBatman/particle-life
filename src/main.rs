@@ -142,6 +142,7 @@ impl Simulation {
 
     pub fn step(&mut self, delta_time: f32) {
         let old_particles = self.particles.clone();
+        let mut resolved_particles = std::collections::HashSet::new();
         for (&id, particle) in &mut self.particles {
             let particle_kind = &self.particle_kinds[&particle.kind_id];
 
@@ -172,8 +173,11 @@ impl Simulation {
                         } else {
                             //  move the rigidbody half way out - the other half is moved in
                             //  another iteration of the loop
-                            particle.pos -= dirn * (min_dist - dist) / 2.;
-                            particle.vel -= dirn * particle.vel.dot(dirn) * self.cfg.collision_vel_damping;
+                            if !resolved_particles.contains(&id) {
+                                particle.pos -= dirn * (min_dist - dist) / 2.;
+                                particle.vel -= dirn * particle.vel.dot(dirn);
+                                resolved_particles.insert(id);
+                            }
                         }
                     }
                     if particle.vel.length_sqr() > self.cfg.max_vel * self.cfg.max_vel {
